@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ISOGuideBot – ISO 27001 Chatbot</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .chat-container {
+      width: 95%;
+      max-width: 800px;
+      background: #020617;
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .chat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #1f2937;
+      padding-bottom: 8px;
+    }
+    .chat-header h1 {
+      font-size: 1.1rem;
+      margin: 0;
+    }
+    .chat-header span {
+      font-size: 0.75rem;
+      color: #9ca3af;
+    }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      border-radius: 8px;
+      background: #020617;
+      border: 1px solid #1f2937;
+      padding: 10px;
+      font-size: 0.9rem;
+    }
+    .msg {
+      margin-bottom: 10px;
+      max-width: 90%;
+      line-height: 1.3;
+      white-space: pre-wrap;
+    }
+    .msg.user {
+      text-align: right;
+    }
+    .msg.user span {
+      display: inline-block;
+      background: #2563eb;
+      color: white;
+      padding: 8px 10px;
+      border-radius: 999px 999px 0 999px;
+    }
+    .msg.bot span {
+      display: inline-block;
+      background: #111827;
+      color: #e5e7eb;
+      padding: 8px 10px;
+      border-radius: 999px 999px 999px 0;
+    }
+    .contexts {
+      margin-top: 4px;
+      font-size: 0.75rem;
+      color: #9ca3af;
+    }
+    form {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    #question {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid #1f2937;
+      background: #020617;
+      color: #e5e7eb;
+      outline: none;
+    }
+    #question:focus {
+      border-color: #2563eb;
+    }
+    button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      background: #22c55e;
+      color: #022c22;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div class="chat-container">
+    <div class="chat-header">
+      <h1>ISOGuideBot · ISO 27001 Helper</h1>
+      <span>RAG mode · /ask endpoint</span>
+    </div>
+    <div id="messages"></div>
+    <form id="chat-form">
+      <input
+        id="question"
+        type="text"
+        placeholder="Ask something like: What is clean desk policy?"
+        autocomplete="off"
+      />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    const API_URL = "http://127.0.0.1:8001/ask"; // change port here if needed
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("question");
+    const messages = document.getElementById("messages");
+    const button = form.querySelector("button");
+
+    function addMessage(text, sender = "bot", contexts = null) {
+      const div = document.createElement("div");
+      div.className = "msg " + sender;
+      const span = document.createElement("span");
+      span.textContent = text;
+      div.appendChild(span);
+
+      if (sender === "bot" && contexts && contexts.length) {
+        const ctxDiv = document.createElement("div");
+        ctxDiv.className = "contexts";
+        ctxDiv.textContent = "Source: " + contexts[0];
+        div.appendChild(ctxDiv);
+      }
+
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const q = input.value.trim();
+      if (!q) return;
+
+      addMessage(q, "user");
+      input.value = "";
+      button.disabled = true;
+
+      try {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: q, top_k: 3 }),
+        });
+
+        if (!res.ok) {
+          addMessage("Error: " + res.status + " " + res.statusText, "bot");
+        } else {
+          const data = await res.json();
+          addMessage(data.answer || "No answer.", "bot", data.contexts);
+        }
+      } catch (err) {
+        console.error(err);
+        addMessage("Request failed. Is the backend running?", "bot");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    // First message
+    addMessage("Hi, I'm ISOGuideBot. Ask me about ISO 27001 controls.");
+  </script>
+</body>
+</html>
