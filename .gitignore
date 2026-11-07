@@ -42,6 +42,3 @@ MANIFEST
 
 # ChromaDB
 data/chroma_db/
-
-# Local tooling
-.claude/

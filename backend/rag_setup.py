@@ -1,24 +1,17 @@
-"""Build the ChromaDB vector store from data/iso27001.txt.
-
-Run from the project root:
-    python -m backend.rag_setup
-"""
-
-import re
+import os
 from pathlib import Path
 
 import chromadb
+from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-# ---------- Paths & constants (shared with backend/main.py) ----------
 
+# Paths
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 DATA_PATH = BASE_DIR / "data" / "iso27001.txt"
 DB_PATH = BASE_DIR / "data" / "chroma_db"
 
 COLLECTION_NAME = "iso27001_controls"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-MAX_CHUNK_CHARS = 600
 
 
 def load_document() -> str:
@@ -27,47 +20,29 @@ def load_document() -> str:
     return DATA_PATH.read_text(encoding="utf-8")
 
 
-def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
+def chunk_text(text: str, max_chars: int = 600) -> list[str]:
     """
-    Split the document into chunks, one per section (sections are separated
-    by blank lines and start with a title line such as
-    "A.7.7 Clear desk and clear screen (Physical controls)").
-
-    A section longer than max_chars is split on sentence boundaries, and the
-    title is repeated on every piece so each chunk still says which control
-    it belongs to.
+    Very simple chunker: splits on double newlines, then further splits
+    long blocks into ~max_chars chunks.
     """
-    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-    chunks: list[dict] = []
+    raw_blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    chunks: list[str] = []
 
-    for block in blocks:
-        title, _, body = block.partition("\n")
-        title = title.strip()
-
+    for block in raw_blocks:
         if len(block) <= max_chars:
-            chunks.append({"title": title, "text": block})
-            continue
-
-        sentences = re.split(r"(?<=[.!?])\s+", body.strip())
-        current = ""
-        for sentence in sentences:
-            if current and len(title) + len(current) + len(sentence) + 2 > max_chars:
-                chunks.append({"title": title, "text": f"{title}\n{current.strip()}"})
-                current = ""
-            current += sentence + " "
-        if current.strip():
-            chunks.append({"title": title, "text": f"{title}\n{current.strip()}"})
+            chunks.append(block)
+        else:
+            # Hard split into fixed-size pieces
+            start = 0
+            while start < len(block):
+                end = start + max_chars
+                chunks.append(block[start:end])
+                start = end
 
     return chunks
 
 
-def control_id(title: str) -> str:
-    """Return the Annex A control number from a title, e.g. 'A.7.7', or ''."""
-    match = re.match(r"(A\.\d+\.\d+)", title)
-    return match.group(1) if match else ""
-
-
-def build_vector_store() -> None:
+def build_vector_store():
     print(f"🔹 Loading document from {DATA_PATH} ...")
     text = load_document()
 
@@ -76,35 +51,30 @@ def build_vector_store() -> None:
     print(f"   → {len(chunks)} chunks created")
 
     print("🔹 Loading embedding model ...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
     print("🔹 Creating ChromaDB client ...")
     DB_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(DB_PATH))
 
-    # Rebuild from scratch every run so the store always matches the text file.
-    existing = [c if isinstance(c, str) else c.name for c in client.list_collections()]
-    if COLLECTION_NAME in existing:
-        print("   → Deleting existing collection ...")
-        client.delete_collection(COLLECTION_NAME)
+    # We will manage embeddings manually (no custom embedding_function)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
-    # Cosine distance suits sentence-transformer embeddings.
-    collection = client.create_collection(
-        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-    )
+    # Clear old data if re-running
+    if collection.count() > 0:
+        print("   → Collection already has data, deleting existing entries...")
+        client.delete_collection(COLLECTION_NAME)
+        collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
     print("🔹 Embedding and inserting chunks ...")
-    documents = [c["text"] for c in chunks]
-    embeddings = model.encode(documents).tolist()
+    ids = [f"chunk-{i}" for i in range(len(chunks))]
+    embeddings = model.encode(chunks).tolist()
 
     collection.add(
-        ids=[f"chunk-{i}" for i in range(len(chunks))],
-        documents=documents,
+        ids=ids,
+        documents=chunks,
         embeddings=embeddings,
-        metadatas=[
-            {"source": "iso27001", "title": c["title"], "control": control_id(c["title"])}
-            for c in chunks
-        ],
+        metadatas=[{"source": "iso27001"} for _ in chunks],
     )
 
     print("✅ Done. Vector store created at:", DB_PATH)
@@ -112,26 +82,34 @@ def build_vector_store() -> None:
     print("   Total documents in collection:", collection.count())
 
 
-def quick_test(query: str = "What is clean desk policy?") -> None:
-    """Retrieval smoke test, using the same embedding model as the API."""
+def quick_test(query: str = "What is clean desk policy?"):
+    """
+    Simple retrieval test to check that our DB works.
+    """
     print("🔹 Running quick retrieval test ...")
     client = chromadb.PersistentClient(path=str(DB_PATH))
-    collection = client.get_collection(name=COLLECTION_NAME)
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
+    if collection.count() == 0:
+        print("⚠️ Collection is empty. Run build_vector_store() first.")
+        return
+
+    print(f"   Query: {query}")
+    # For this simple test, we let Chroma use its default embedding; not ideal,
+    # but good enough to see if something comes back.
     results = collection.query(
-        query_embeddings=model.encode([query]).tolist(),
+        query_texts=[query],
         n_results=3,
     )
 
-    print(f"   Query: {query}")
-    for i, (doc, dist) in enumerate(
-        zip(results["documents"][0], results["distances"][0]), start=1
-    ):
-        print(f"\n--- Result {i} (cosine distance {dist:.3f}) ---")
-        print(doc)
+    docs = results.get("documents", [[]])[0]
+    print("   Top results:")
+    for i, d in enumerate(docs, start=1):
+        print(f"\n--- Result {i} ---")
+        print(d)
 
 
 if __name__ == "__main__":
     build_vector_store()
+    # Optional: run a quick test
     quick_test()
