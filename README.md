@@ -10,6 +10,8 @@ Built with:
 
 Fully open-source and runs locally. No external LLM APIs, no API key.
 
+![ISOGuideBot chat answering questions about MFA and backups](docs/screenshot.jpg)
+
 ---
 
 ## 📌 Features
