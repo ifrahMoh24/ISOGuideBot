@@ -1,72 +1,107 @@
-from pathlib import Path
+"""ISOGuideBot API: semantic search over ISO/IEC 27001:2022 controls.
+
+Runs fully locally: no external LLM API, no API key.
+
+Run from the project root:
+    uvicorn backend.main:app --reload --port 8001
+"""
+
+import os
 from typing import List
 
 import chromadb
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
-# ---------- Paths & Constants ----------
+from backend.rag_setup import COLLECTION_NAME, DB_PATH, EMBEDDING_MODEL
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "data" / "chroma_db"
-COLLECTION_NAME = "iso27001_controls"
+# ---------- Settings ----------
 
-# ---------- Load models & DB at startup ----------
+# Chunks further away than this (cosine distance) are treated as unrelated.
+# Measured on sample queries: ISO questions land at 0.37-0.74, off-topic
+# questions ("capital of France", "overtime pay") at 0.85+.
+MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "0.80"))
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS", "http://127.0.0.1:5500,http://localhost:5500"
+).split(",")
 
-print("🔹 Loading embedding model for API ...")
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+NOT_COVERED = (
+    "I couldn't find anything about that in the ISO 27001 guide. "
+    "Try asking about a specific control, such as access control, "
+    "incident management or clear desk."
+)
+
+# ---------- Load model & DB at startup ----------
+
+print("🔹 Loading embedding model ...")
+embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
 print("🔹 Connecting to ChromaDB ...")
 client = chromadb.PersistentClient(path=str(DB_PATH))
-collection = client.get_or_create_collection(name=COLLECTION_NAME)
-
-print(f"   → Collection has {collection.count()} documents")
-
+try:
+    collection = client.get_collection(name=COLLECTION_NAME)
+except Exception as exc:  # the vector store was never built
+    raise RuntimeError(
+        "Vector store not found. Build it first with: python -m backend.rag_setup"
+    ) from exc
+print(f"   → Collection has {collection.count()} chunks")
 
 # ---------- FastAPI setup ----------
 
 app = FastAPI(
     title="ISOGuideBot API",
-    version="0.1.0",
-    description="ISO 27001 Decision Support Chatbot backend (RAG-only version).",
+    version="1.0.0",
+    description="ISO/IEC 27001:2022 decision-support chatbot (local semantic search).",
 )
 
-# Add CORS middleware to allow requests from frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow requests from any origin
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
 class AskRequest(BaseModel):
-    question: str
-    top_k: int = 3
+    question: str = Field(..., min_length=1, max_length=1000)
+    top_k: int = Field(3, ge=1, le=10)
+
+
+class Source(BaseModel):
+    control: str  # e.g. "A.7.7", or "" for general sections
+    title: str
+    text: str
+    distance: float
 
 
 class AskResponse(BaseModel):
     question: str
     answer: str
-    contexts: List[str]
+    sources: List[Source]
 
 
-# ---------- Helper: retrieve relevant chunks ----------
+# ---------- Retrieval ----------
 
-def retrieve_context(question: str, top_k: int = 3) -> List[str]:
-    """Embed the question and retrieve relevant ISO 27001 chunks from Chroma."""
-    query_embedding = embedding_model.encode([question]).tolist()
-
+def retrieve(question: str, top_k: int) -> List[Source]:
+    """Embed the question and return the closest chunks within MAX_DISTANCE."""
     results = collection.query(
-        query_embeddings=query_embedding,
+        query_embeddings=embedding_model.encode([question]).tolist(),
         n_results=top_k,
     )
-
-    docs = results.get("documents", [[]])[0]
-    return docs
+    return [
+        Source(
+            control=meta.get("control", ""),
+            title=meta.get("title", ""),
+            text=doc,
+            distance=round(dist, 3),
+        )
+        for doc, meta, dist in zip(
+            results["documents"][0], results["metadatas"][0], results["distances"][0]
+        )
+        if dist <= MAX_DISTANCE
+    ]
 
 
 # ---------- Endpoints ----------
@@ -74,28 +109,18 @@ def retrieve_context(question: str, top_k: int = 3) -> List[str]:
 @app.get("/")
 def root():
     return {
-        "message": "ISOGuideBot API is running. Use POST /ask to query ISO 27001 controls."
+        "message": "ISOGuideBot API is running. POST /ask to query ISO 27001 controls.",
+        "chunks": collection.count(),
     }
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask_iso_bot(payload: AskRequest):
-    question = payload.question
-    top_k = payload.top_k
+def ask(payload: AskRequest):
+    question = payload.question.strip()
+    sources = retrieve(question, payload.top_k)
 
-    contexts = retrieve_context(question, top_k=top_k)
+    if not sources:
+        return AskResponse(question=question, answer=NOT_COVERED, sources=[])
 
-    if not contexts:
-        return AskResponse(
-            question=question,
-            answer="I could not find any relevant ISO 27001 guidance for this question.",
-            contexts=[],
-        )
-
-    best_context = contexts[0]
-
-    return AskResponse(
-        question=question,
-        answer=best_context,
-        contexts=contexts,
-    )
+    # The best match is the answer; the rest are shown as related controls.
+    return AskResponse(question=question, answer=sources[0].text, sources=sources)
